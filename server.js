@@ -26,10 +26,34 @@ nextApp.prepare().then(() => {
     if (!process.env.DEEPGRAM_API_KEY) { client.close(1011, "DEEPGRAM_API_KEY is required"); return; }
     const url = new URL(request.url, "http://localhost"); const deepgram = new DeepgramClient({ apiKey: process.env.DEEPGRAM_API_KEY });
     const connection = await deepgram.speak.v2.createConnection({ model: url.searchParams.get("model") || process.env.DEEPGRAM_TTS_MODEL || "flux-alexis-en", encoding: url.searchParams.get("encoding") || "linear16", sample_rate: url.searchParams.get("sample_rate") || "24000" });
-    connection.on("message", async (data) => { if (client.readyState !== WebSocket.OPEN) return; if (data instanceof ArrayBuffer) client.send(Buffer.from(data), { binary: true }); else if (Buffer.isBuffer(data)) client.send(data, { binary: true }); else client.send(JSON.stringify(data)); });
+    let ready = false;
+    const pending = [];
+    const forward = async (data) => {
+      if (client.readyState !== WebSocket.OPEN) return;
+      if (data instanceof ArrayBuffer) client.send(Buffer.from(data), { binary: true });
+      else if (typeof Blob !== "undefined" && data instanceof Blob) client.send(Buffer.from(await data.arrayBuffer()), { binary: true });
+      else if (Buffer.isBuffer(data)) client.send(data, { binary: true });
+      else client.send(JSON.stringify(data));
+    };
+    const dispatch = (message) => {
+      if (message.type === "Speak") connection.sendSpeak({ type: "Speak", text: message.text });
+      if (message.type === "Flush") connection.sendFlush({ type: "Flush" });
+      if (message.type === "Close") connection.sendClose({ type: "Close" });
+    };
+    connection.on("message", (data) => forward(data).catch(() => client.close(1011, "Failed to forward audio")));
     connection.on("error", () => client.close(1011, "Deepgram connection error"));
-    client.on("message", (raw) => { try { const message = JSON.parse(raw.toString()); if (message.type === "Speak") connection.sendSpeak({ type: "Speak", text: message.text }); if (message.type === "Flush") connection.sendFlush({ type: "Flush" }); if (message.type === "Close") connection.sendClose({ type: "Close" }); } catch {} });
-    client.on("close", () => connection.close()); connection.connect();
+    client.on("message", (raw) => {
+      try {
+        const message = JSON.parse(raw.toString());
+        if (ready) dispatch(message);
+        else pending.push(message);
+      } catch {}
+    });
+    client.on("close", () => connection.close());
+    connection.connect();
+    await connection.waitForOpen();
+    ready = true;
+    for (const message of pending) dispatch(message);
   });
   server.listen(process.env.PORT || 3000, () => console.log("Next.js Flux TTS running on http://localhost:3000"));
 });
